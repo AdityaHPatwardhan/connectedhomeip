@@ -42,6 +42,10 @@
 #include <lib/support/TimeUtils.h>
 #include <protocols/Protocols.h>
 
+#if CHIP_CRYPTO_OPENSSL
+#include <openssl/evp.h>
+#endif // CHIP_CRYPTO_OPENSSL
+
 namespace chip {
 namespace Credentials {
 
@@ -143,8 +147,10 @@ CHIP_ERROR ChipCertificateSet::LoadCert(TLVReader & reader, BitFlags<CertDecodeF
     VerifyOrReturnError(cert.mCertFlags.HasAll(CertFlags::kExtPresent_SubjectKeyId, CertFlags::kExtPresent_AuthKeyId),
                         CHIP_ERROR_UNSUPPORTED_CERT_FORMAT);
 
-    // Verify the cert was signed with ECDSA-SHA256. This is the only signature algorithm currently supported.
-    VerifyOrReturnError(cert.mSigAlgoOID == kOID_SigAlgo_ECDSAWithSHA256, CHIP_ERROR_UNSUPPORTED_SIGNATURE_TYPE);
+    // Verify the cert was signed with a supported signature algorithm.
+    VerifyOrReturnError(cert.mSigAlgoOID == kOID_SigAlgo_ECDSAWithSHA256 || cert.mSigAlgoOID == kOID_SigAlgo_ML_DSA_44 ||
+                            cert.mSigAlgoOID == kOID_SigAlgo_ML_DSA_65,
+                        CHIP_ERROR_UNSUPPORTED_SIGNATURE_TYPE);
 
     // Check if this cert matches any currently loaded certificates
     for (uint32_t i = 0; i < mCertCount; i++)
@@ -159,7 +165,7 @@ CHIP_ERROR ChipCertificateSet::LoadCert(TLVReader & reader, BitFlags<CertDecodeF
     // Verify we have room for the new certificate.
     VerifyOrReturnError(mCertCount < mMaxCerts, CHIP_ERROR_NO_MEMORY);
 
-    new (&mCerts[mCertCount]) ChipCertificateData(cert);
+    new (&mCerts[mCertCount]) ChipCertificateData(std::move(cert));
     mCertCount++;
 
     return CHIP_NO_ERROR;
@@ -226,10 +232,88 @@ CHIP_ERROR ChipCertificateSet::VerifySignature(const ChipCertificateData * cert,
     return VerifyCertSignature(*cert, *caCert);
 }
 
+static bool IsMLDSASigAlgo(uint16_t oid)
+{
+    return (oid == kOID_SigAlgo_ML_DSA_44 || oid == kOID_SigAlgo_ML_DSA_65);
+}
+
+#if CHIP_CRYPTO_OPENSSL
+/**
+ * Verify an ML-DSA signature using the OpenSSL 3.5+ EVP API.
+ *
+ * ML-DSA (FIPS 204) is a "pure" signature scheme: the signing operation
+ * takes the raw message (the DER-encoded TBSCertificate), not a pre-hash.
+ * The raw DER TBS bytes are retained in cert.mTBSDERBuf during decode.
+ */
+static CHIP_ERROR VerifyMLDSASignature_OpenSSL(const ChipCertificateData & cert, const ChipCertificateData & signer)
+{
+    const char * algoName = nullptr;
+
+    if (cert.mSigAlgoOID == kOID_SigAlgo_ML_DSA_44)
+        algoName = "ML-DSA-44";
+    else if (cert.mSigAlgoOID == kOID_SigAlgo_ML_DSA_65)
+        algoName = "ML-DSA-65";
+    else
+        return CHIP_ERROR_UNSUPPORTED_SIGNATURE_TYPE;
+
+    // The DER TBS must have been retained during decode.
+    VerifyOrReturnError(cert.mTBSDERBuf.Get() != nullptr && cert.mTBSDERBuf.AllocatedSize() > 0,
+                        CHIP_ERROR_INCORRECT_STATE);
+
+    // Import the signer's ML-DSA public key into an EVP_PKEY.
+    EVP_PKEY * pkey = EVP_PKEY_new_raw_public_key_ex(nullptr, algoName, nullptr, signer.mPQCPublicKey.data(),
+                                                      signer.mPQCPublicKey.size());
+    VerifyOrReturnError(pkey != nullptr, CHIP_ERROR_INTERNAL);
+
+    struct EVP_PKEY_Deleter
+    {
+        void operator()(EVP_PKEY * k) { EVP_PKEY_free(k); }
+    };
+    std::unique_ptr<EVP_PKEY, EVP_PKEY_Deleter> pkeyGuard(pkey);
+
+    EVP_MD_CTX * mdCtx = EVP_MD_CTX_new();
+    VerifyOrReturnError(mdCtx != nullptr, CHIP_ERROR_NO_MEMORY);
+
+    struct EVP_MD_CTX_Deleter
+    {
+        void operator()(EVP_MD_CTX * c) { EVP_MD_CTX_free(c); }
+    };
+    std::unique_ptr<EVP_MD_CTX, EVP_MD_CTX_Deleter> mdCtxGuard(mdCtx);
+
+    // ML-DSA one-shot verify: no digest parameter (nullptr), raw message input.
+    VerifyOrReturnError(EVP_DigestVerifyInit(mdCtx, nullptr, nullptr, nullptr, pkey) == 1, CHIP_ERROR_INTERNAL);
+
+    // Verify using the raw DER TBS bytes (not a hash) as required by ML-DSA.
+    int result = EVP_DigestVerify(mdCtx, cert.mPQCSignature.data(), cert.mPQCSignature.size(), cert.mTBSDERBuf.Get(),
+                                  cert.mTBSDERBuf.AllocatedSize());
+
+    VerifyOrReturnError(result == 1, CHIP_ERROR_INVALID_SIGNATURE);
+
+    return CHIP_NO_ERROR;
+}
+#endif // CHIP_CRYPTO_OPENSSL
+
 CHIP_ERROR VerifyCertSignature(const ChipCertificateData & cert, const ChipCertificateData & signer)
 {
     VerifyOrReturnError(cert.mCertFlags.Has(CertFlags::kTBSHashPresent), CHIP_ERROR_INVALID_ARGUMENT);
-    VerifyOrReturnError(cert.mSigAlgoOID == kOID_SigAlgo_ECDSAWithSHA256, CHIP_ERROR_UNSUPPORTED_SIGNATURE_TYPE);
+    VerifyOrReturnError(cert.mSigAlgoOID == kOID_SigAlgo_ECDSAWithSHA256 || IsMLDSASigAlgo(cert.mSigAlgoOID),
+                        CHIP_ERROR_UNSUPPORTED_SIGNATURE_TYPE);
+
+    if (IsMLDSASigAlgo(cert.mSigAlgoOID))
+    {
+#if CHIP_CRYPTO_OPENSSL
+        // ML-DSA signature verification using OpenSSL 3.5+ EVP API.
+        // The PQC public key and signature are stored in the ByteSpan fields
+        // since they are too large for the fixed-size P256 types.
+        VerifyOrReturnError(!signer.mPQCPublicKey.empty(), CHIP_ERROR_CERT_NOT_TRUSTED);
+        VerifyOrReturnError(!cert.mPQCSignature.empty(), CHIP_ERROR_INVALID_SIGNATURE);
+
+        return VerifyMLDSASignature_OpenSSL(cert, signer);
+#else
+        // ML-DSA verification not available on non-OpenSSL platforms.
+        return CHIP_ERROR_UNSUPPORTED_SIGNATURE_TYPE;
+#endif // CHIP_CRYPTO_OPENSSL
+    }
 
 #ifdef ENABLE_HSM_ECDSA_VERIFY
     P256PublicKeyHSM signerPublicKey;
@@ -480,7 +564,10 @@ void ChipCertificateData::Clear()
     mCertFlags.ClearAll();
     mKeyUsageFlags.ClearAll();
     mKeyPurposeFlags.ClearAll();
-    mSignature = P256ECDSASignatureSpan();
+    mSignature    = P256ECDSASignatureSpan();
+    mPQCPublicKey = ByteSpan();
+    mPQCSignature = ByteSpan();
+    mTBSDERBuf.Free();
 
     memset(mTBSHash, 0, sizeof(mTBSHash));
 }
@@ -491,11 +578,13 @@ bool ChipCertificateData::IsEqual(const ChipCertificateData & other) const
     return mSubjectDN.IsEqual(other.mSubjectDN) && mIssuerDN.IsEqual(other.mIssuerDN) &&
         mSubjectKeyId.data_equal(other.mSubjectKeyId) && mAuthKeyId.data_equal(other.mAuthKeyId) &&
         (mNotBeforeTime == other.mNotBeforeTime) && (mNotAfterTime == other.mNotAfterTime) &&
-        mPublicKey.data_equal(other.mPublicKey) && (mPubKeyCurveOID == other.mPubKeyCurveOID) &&
-        (mPubKeyAlgoOID == other.mPubKeyAlgoOID) && (mSigAlgoOID == other.mSigAlgoOID) &&
-        (mCertFlags.Raw() == other.mCertFlags.Raw()) && (mKeyUsageFlags.Raw() == other.mKeyUsageFlags.Raw()) &&
+        mPublicKey.data_equal(other.mPublicKey) && mPQCPublicKey.data_equal(other.mPQCPublicKey) &&
+        (mPubKeyCurveOID == other.mPubKeyCurveOID) && (mPubKeyAlgoOID == other.mPubKeyAlgoOID) &&
+        (mSigAlgoOID == other.mSigAlgoOID) && (mCertFlags.Raw() == other.mCertFlags.Raw()) &&
+        (mKeyUsageFlags.Raw() == other.mKeyUsageFlags.Raw()) &&
         (mKeyPurposeFlags.Raw() == other.mKeyPurposeFlags.Raw()) && (mPathLenConstraint == other.mPathLenConstraint) &&
-        mSignature.data_equal(other.mSignature) && (memcmp(mTBSHash, other.mTBSHash, sizeof(mTBSHash)) == 0);
+        mSignature.data_equal(other.mSignature) && mPQCSignature.data_equal(other.mPQCSignature) &&
+        (memcmp(mTBSHash, other.mTBSHash, sizeof(mTBSHash)) == 0);
 }
 
 void ValidationContext::Reset()

@@ -39,6 +39,7 @@
 #include <lib/core/TLV.h>
 #include <lib/support/BitFlags.h>
 #include <lib/support/DLLUtil.h>
+#include <lib/support/ScopedMemoryBuffer.h>
 #include <lib/support/Span.h>
 #include <system/SystemClock.h>
 
@@ -53,6 +54,13 @@ static constexpr uint16_t kX509NoWellDefinedExpirationDateYear = 9999;
 // As per specifications (6.4.5. Node Operational Credentials Certificates)
 static constexpr uint32_t kMaxCHIPCertLength = 400;
 static constexpr uint32_t kMaxDERCertLength  = 600;
+
+// Maximum certificate sizes for post-quantum (ML-DSA) certificates.
+// ML-DSA-65 (largest supported variant): pubkey 1952B, signature 3309B.
+// These constants are used by PQC-aware code (e.g., chip-cert tool, PQC cert validation).
+// Non-PQC code continues to use kMaxCHIPCertLength / kMaxDERCertLength.
+static constexpr uint32_t kMaxPQCCHIPCertLength = 6144;
+static constexpr uint32_t kMaxPQCDERCertLength  = 6144;
 
 // As per spec section 11.24 (Wi-Fi Authentication with Per-Device Credentials)
 inline constexpr uint32_t kMaxCHIPCompactNetworkIdentityLength = 137;
@@ -463,7 +471,18 @@ struct ChipCertificateData
     BitFlags<KeyUsageFlags> mKeyUsageFlags;     /**< Certificate key usage extensions flags. */
     BitFlags<KeyPurposeFlags> mKeyPurposeFlags; /**< Certificate extended key usage extensions flags. */
     uint8_t mPathLenConstraint;                 /**< Basic constraint: path length. */
-    P256ECDSASignatureSpan mSignature;          /**< Certificate signature. */
+    P256ECDSASignatureSpan mSignature;          /**< Certificate signature (ECDSA only). */
+
+    // PQC (ML-DSA) certificate data. These ByteSpans point into the original
+    // certificate buffer and are only populated for ML-DSA certificates.
+    // For ECDSA certificates, these remain empty.
+    ByteSpan mPQCPublicKey;  /**< ML-DSA public key (variable size, up to 1952B for ML-DSA-65). */
+    ByteSpan mPQCSignature;  /**< ML-DSA signature (variable size, up to 3309B for ML-DSA-65). */
+
+    // ML-DSA verification requires the raw DER TBS (not a hash) because ML-DSA
+    // is a "pure" signature scheme. This buffer owns the reconstructed DER TBS
+    // bytes and is only allocated for ML-DSA certificates.
+    Platform::ScopedMemoryBufferWithSize<uint8_t> mTBSDERBuf;
 
     uint8_t mTBSHash[Crypto::kSHA256_Hash_Length]; /**< Certificate TBS hash. */
 };
