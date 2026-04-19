@@ -82,6 +82,16 @@ exit:
     return err;
 }
 
+static bool IsMLDSAPubKeyAlgo(OID oid)
+{
+    return (oid == kOID_PubKeyAlgo_ML_DSA_44 || oid == kOID_PubKeyAlgo_ML_DSA_65);
+}
+
+static bool IsMLDSASigAlgo(uint16_t oid)
+{
+    return (oid == kOID_SigAlgo_ML_DSA_44 || oid == kOID_SigAlgo_ML_DSA_65);
+}
+
 static CHIP_ERROR DecodeConvertSubjectPublicKeyInfo(TLVReader & reader, ASN1Writer & writer, ChipCertificateData & certData)
 {
     CHIP_ERROR err;
@@ -91,13 +101,20 @@ static CHIP_ERROR DecodeConvertSubjectPublicKeyInfo(TLVReader & reader, ASN1Writ
     ReturnErrorOnFailure(reader.Get(pubKeyAlgoId));
 
     certData.mPubKeyAlgoOID = GetOID(kOIDCategory_PubKeyAlgo, pubKeyAlgoId);
-    VerifyOrReturnError(certData.mPubKeyAlgoOID == kOID_PubKeyAlgo_ECPublicKey, CHIP_ERROR_UNSUPPORTED_CERT_FORMAT);
 
-    ReturnErrorOnFailure(reader.Next(ContextTag(kTag_EllipticCurveIdentifier)));
-    ReturnErrorOnFailure(reader.Get(pubKeyCurveId));
+    bool isMLDSA = IsMLDSAPubKeyAlgo(static_cast<OID>(certData.mPubKeyAlgoOID));
 
-    certData.mPubKeyCurveOID = GetOID(kOIDCategory_EllipticCurve, pubKeyCurveId);
-    VerifyOrReturnError(certData.mPubKeyCurveOID == kOID_EllipticCurve_prime256v1, CHIP_ERROR_UNSUPPORTED_ELLIPTIC_CURVE);
+    VerifyOrReturnError(certData.mPubKeyAlgoOID == kOID_PubKeyAlgo_ECPublicKey || isMLDSA, CHIP_ERROR_UNSUPPORTED_CERT_FORMAT);
+
+    // ML-DSA does not use an elliptic curve identifier.
+    if (!isMLDSA)
+    {
+        ReturnErrorOnFailure(reader.Next(ContextTag(kTag_EllipticCurveIdentifier)));
+        ReturnErrorOnFailure(reader.Get(pubKeyCurveId));
+
+        certData.mPubKeyCurveOID = GetOID(kOIDCategory_EllipticCurve, pubKeyCurveId);
+        VerifyOrReturnError(certData.mPubKeyCurveOID == kOID_EllipticCurve_prime256v1, CHIP_ERROR_UNSUPPORTED_ELLIPTIC_CURVE);
+    }
 
     // subjectPublicKeyInfo SubjectPublicKeyInfo,
     ASN1_START_SEQUENCE
@@ -107,26 +124,44 @@ static CHIP_ERROR DecodeConvertSubjectPublicKeyInfo(TLVReader & reader, ASN1Writ
         ASN1_START_SEQUENCE
         {
             // algorithm OBJECT IDENTIFIER,
-            ASN1_ENCODE_OBJECT_ID(certData.mPubKeyAlgoOID);
+            ASN1_ENCODE_OBJECT_ID(static_cast<OID>(certData.mPubKeyAlgoOID));
 
-            // EcpkParameters ::= CHOICE {
-            //     ecParameters  ECParameters,
-            //     namedCurve    OBJECT IDENTIFIER,
-            //     implicitlyCA  NULL }
-            //
-            // (Only namedCurve supported).
-            //
-            ASN1_ENCODE_OBJECT_ID(certData.mPubKeyCurveOID);
+            if (!isMLDSA)
+            {
+                // EcpkParameters ::= CHOICE {
+                //     ecParameters  ECParameters,
+                //     namedCurve    OBJECT IDENTIFIER,
+                //     implicitlyCA  NULL }
+                //
+                // (Only namedCurve supported).
+                //
+                ASN1_ENCODE_OBJECT_ID(static_cast<OID>(certData.mPubKeyCurveOID));
+            }
         }
         ASN1_END_SEQUENCE;
 
         ReturnErrorOnFailure(reader.Next(kTLVType_ByteString, ContextTag(kTag_EllipticCurvePublicKey)));
-        ReturnErrorOnFailure(reader.Get(certData.mPublicKey));
 
-        static_assert(P256PublicKeySpan().size() <= UINT16_MAX, "Public key size doesn't fit in a uint16_t");
+        if (isMLDSA)
+        {
+            // ML-DSA public keys are variable-size and too large for P256PublicKeySpan.
+            // Read as ByteSpan, store in certData for later verification, and write to ASN1 output.
+            ByteSpan pubKeyBytes;
+            ReturnErrorOnFailure(reader.Get(pubKeyBytes));
+            certData.mPQCPublicKey = pubKeyBytes;
+            VerifyOrReturnError(CanCastTo<uint16_t>(pubKeyBytes.size()), CHIP_ERROR_UNSUPPORTED_CERT_FORMAT);
+            ReturnErrorOnFailure(writer.PutBitString(0, pubKeyBytes.data(), static_cast<uint16_t>(pubKeyBytes.size())));
+        }
+        else
+        {
+            ReturnErrorOnFailure(reader.Get(certData.mPublicKey));
 
-        // For EC certs, the subjectPublicKey BIT STRING contains the X9.62 encoded EC point.
-        ReturnErrorOnFailure(writer.PutBitString(0, certData.mPublicKey.data(), static_cast<uint16_t>(certData.mPublicKey.size())));
+            static_assert(P256PublicKeySpan().size() <= UINT16_MAX, "Public key size doesn't fit in a uint16_t");
+
+            // For EC certs, the subjectPublicKey BIT STRING contains the X9.62 encoded EC point.
+            ReturnErrorOnFailure(
+                writer.PutBitString(0, certData.mPublicKey.data(), static_cast<uint16_t>(certData.mPublicKey.size())));
+        }
     }
     ASN1_END_SEQUENCE;
 
@@ -467,6 +502,26 @@ exit:
     return err;
 }
 
+static CHIP_ERROR DecodeConvertMLDSASignature(TLVReader & reader, ASN1Writer & writer, ChipCertificateData & certData)
+{
+    ByteSpan sigBytes;
+
+    ReturnErrorOnFailure(reader.Next(kTLVType_ByteString, ContextTag(kTag_ECDSASignature)));
+    ReturnErrorOnFailure(reader.Get(sigBytes));
+
+    // ML-DSA signatures are too large for P256ECDSASignatureSpan (certData.mSignature).
+    // Store in the PQC-specific ByteSpan field instead.
+    certData.mPQCSignature = sigBytes;
+
+    VerifyOrReturnError(!writer.IsNullWriter(), CHIP_NO_ERROR);
+
+    // ML-DSA signatures are raw byte strings, written directly as a BIT STRING (not DER-encoded r,s).
+    VerifyOrReturnError(CanCastTo<uint16_t>(sigBytes.size()), CHIP_ERROR_UNSUPPORTED_CERT_FORMAT);
+    ReturnErrorOnFailure(writer.PutBitString(0, sigBytes.data(), static_cast<uint16_t>(sigBytes.size())));
+
+    return CHIP_NO_ERROR;
+}
+
 /**
  * @brief Decode and convert the To-Be-Signed (TBS) portion of the CHIP certificate
  *        into X.509 DER encoded form.
@@ -625,7 +680,14 @@ static CHIP_ERROR DecodeConvertCert(TLVReader & reader, ASN1Writer & writer, ASN
         ASN1_END_SEQUENCE;
 
         // signatureValue BIT STRING
-        ReturnErrorOnFailure(DecodeConvertECDSASignature(reader, writer, certData));
+        if (IsMLDSASigAlgo(certData.mSigAlgoOID))
+        {
+            ReturnErrorOnFailure(DecodeConvertMLDSASignature(reader, writer, certData));
+        }
+        else
+        {
+            ReturnErrorOnFailure(DecodeConvertECDSASignature(reader, writer, certData));
+        }
     }
     ASN1_END_SEQUENCE;
 
@@ -675,16 +737,32 @@ CHIP_ERROR DecodeChipCert(TLVReader & reader, ChipCertificateData & certData, Bi
     {
         // Create a buffer and writer to capture the TBS (to-be-signed) portion of the certificate
         // when we decode (and convert) the certificate, so we can hash it to create the TBSHash.
+        // Use the larger PQC buffer size to accommodate both ECDSA and ML-DSA certificates.
+        // The sig algorithm isn't known until after decode, so we allocate for the worst case.
+        constexpr size_t tbsBufSize = kMaxPQCCHIPCertDecodeBufLength;
         chip::Platform::ScopedMemoryBuffer<uint8_t> asn1TBSBuf;
-        VerifyOrReturnError(asn1TBSBuf.Alloc(kMaxCHIPCertDecodeBufLength), CHIP_ERROR_NO_MEMORY);
+        VerifyOrReturnError(asn1TBSBuf.Alloc(tbsBufSize), CHIP_ERROR_NO_MEMORY);
         ASN1Writer tbsWriter;
-        tbsWriter.Init(asn1TBSBuf.Get(), kMaxCHIPCertDecodeBufLength);
+        tbsWriter.Init(asn1TBSBuf.Get(), tbsBufSize);
 
         ReturnErrorOnFailure(DecodeConvertCert(reader, nullWriter, tbsWriter, certData));
 
-        // Hash the encoded TBS certificate. Only SHA256 is supported.
-        VerifyOrReturnError(certData.mSigAlgoOID == kOID_SigAlgo_ECDSAWithSHA256, CHIP_ERROR_UNSUPPORTED_SIGNATURE_TYPE);
-        ReturnErrorOnFailure(Hash_SHA256(asn1TBSBuf.Get(), tbsWriter.GetLengthWritten(), certData.mTBSHash));
+        VerifyOrReturnError(certData.mSigAlgoOID == kOID_SigAlgo_ECDSAWithSHA256 || IsMLDSASigAlgo(certData.mSigAlgoOID),
+                            CHIP_ERROR_UNSUPPORTED_SIGNATURE_TYPE);
+
+        const size_t tbsLen = tbsWriter.GetLengthWritten();
+
+        if (IsMLDSASigAlgo(certData.mSigAlgoOID))
+        {
+            // ML-DSA is a "pure" signature scheme: verification operates on the raw DER TBS
+            // bytes, not a hash. Retain the reconstructed DER TBS in an owned buffer.
+            VerifyOrReturnError(certData.mTBSDERBuf.Alloc(tbsLen), CHIP_ERROR_NO_MEMORY);
+            memcpy(certData.mTBSDERBuf.Get(), asn1TBSBuf.Get(), tbsLen);
+        }
+
+        // Always compute and store the TBS hash (used by ECDSA verification,
+        // and retained for ML-DSA for consistency / logging).
+        ReturnErrorOnFailure(Hash_SHA256(asn1TBSBuf.Get(), tbsLen, certData.mTBSHash));
         certData.mCertFlags.Set(CertFlags::kTBSHashPresent);
     }
     else

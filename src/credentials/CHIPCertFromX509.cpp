@@ -83,6 +83,16 @@ exit:
     return err;
 }
 
+static bool IsMLDSAPubKeyAlgo(OID oid)
+{
+    return (oid == kOID_PubKeyAlgo_ML_DSA_44 || oid == kOID_PubKeyAlgo_ML_DSA_65);
+}
+
+static bool IsMLDSASigAlgo(OID oid)
+{
+    return (oid == kOID_SigAlgo_ML_DSA_44 || oid == kOID_SigAlgo_ML_DSA_65);
+}
+
 static CHIP_ERROR ConvertSubjectPublicKeyInfo(ASN1Reader & reader, TLVWriter & writer)
 {
     CHIP_ERROR err;
@@ -99,36 +109,41 @@ static CHIP_ERROR ConvertSubjectPublicKeyInfo(ASN1Reader & reader, TLVWriter & w
             ASN1_PARSE_OBJECT_ID(pubKeyAlgoOID);
 
             // Verify that the algorithm type is supported.
-            VerifyOrExit(pubKeyAlgoOID == kOID_PubKeyAlgo_ECPublicKey, err = ASN1_ERROR_UNSUPPORTED_ENCODING);
+            VerifyOrExit(pubKeyAlgoOID == kOID_PubKeyAlgo_ECPublicKey || IsMLDSAPubKeyAlgo(pubKeyAlgoOID),
+                         err = ASN1_ERROR_UNSUPPORTED_ENCODING);
 
             err = writer.Put(ContextTag(kTag_PublicKeyAlgorithm), GetOIDEnum(pubKeyAlgoOID));
             SuccessOrExit(err);
 
-            // EcpkParameters ::= CHOICE {
-            //     ecParameters  ECParameters,
-            //     namedCurve    OBJECT IDENTIFIER,
-            //     implicitlyCA  NULL }
-            ASN1_PARSE_ANY;
-
-            // ecParameters and implicitlyCA not supported.
-            if (reader.GetClass() == kASN1TagClass_Universal && reader.GetTag() == kASN1UniversalTag_Sequence)
+            // ML-DSA AlgorithmIdentifier has no parameters (no curve OID).
+            if (!IsMLDSAPubKeyAlgo(pubKeyAlgoOID))
             {
-                ExitNow(err = ASN1_ERROR_UNSUPPORTED_ENCODING);
+                // EcpkParameters ::= CHOICE {
+                //     ecParameters  ECParameters,
+                //     namedCurve    OBJECT IDENTIFIER,
+                //     implicitlyCA  NULL }
+                ASN1_PARSE_ANY;
+
+                // ecParameters and implicitlyCA not supported.
+                if (reader.GetClass() == kASN1TagClass_Universal && reader.GetTag() == kASN1UniversalTag_Sequence)
+                {
+                    ExitNow(err = ASN1_ERROR_UNSUPPORTED_ENCODING);
+                }
+                if (reader.GetClass() == kASN1TagClass_Universal && reader.GetTag() == kASN1UniversalTag_Null)
+                {
+                    ExitNow(err = ASN1_ERROR_UNSUPPORTED_ENCODING);
+                }
+
+                ASN1_VERIFY_TAG(kASN1TagClass_Universal, kASN1UniversalTag_ObjectId);
+
+                ASN1_GET_OBJECT_ID(pubKeyCurveOID);
+
+                // Verify the curve name is recognized.
+                VerifyOrExit(GetOIDCategory(pubKeyCurveOID) == kOIDCategory_EllipticCurve, err = ASN1_ERROR_UNSUPPORTED_ENCODING);
+
+                err = writer.Put(ContextTag(kTag_EllipticCurveIdentifier), GetOIDEnum(pubKeyCurveOID));
+                SuccessOrExit(err);
             }
-            if (reader.GetClass() == kASN1TagClass_Universal && reader.GetTag() == kASN1UniversalTag_Null)
-            {
-                ExitNow(err = ASN1_ERROR_UNSUPPORTED_ENCODING);
-            }
-
-            ASN1_VERIFY_TAG(kASN1TagClass_Universal, kASN1UniversalTag_ObjectId);
-
-            ASN1_GET_OBJECT_ID(pubKeyCurveOID);
-
-            // Verify the curve name is recognized.
-            VerifyOrExit(GetOIDCategory(pubKeyCurveOID) == kOIDCategory_EllipticCurve, err = ASN1_ERROR_UNSUPPORTED_ENCODING);
-
-            err = writer.Put(ContextTag(kTag_EllipticCurveIdentifier), GetOIDEnum(pubKeyCurveOID));
-            SuccessOrExit(err);
         }
         ASN1_EXIT_SEQUENCE;
 
@@ -141,7 +156,8 @@ static CHIP_ERROR ConvertSubjectPublicKeyInfo(ASN1Reader & reader, TLVWriter & w
         // The first byte is Unused Bit Count value, which should be zero.
         VerifyOrExit(reader.GetValue()[0] == 0, err = ASN1_ERROR_INVALID_ENCODING);
 
-        // Copy the X9.62 encoded EC point into the CHIP certificate as a byte string.
+        // Copy the public key into the CHIP certificate as a byte string.
+        // For EC keys this is the X9.62 encoded EC point; for ML-DSA this is the raw public key.
         // Skip the first Unused Bit Count byte.
         err = writer.PutBytes(ContextTag(kTag_EllipticCurvePublicKey), reader.GetValue() + 1, reader.GetValueLen() - 1);
         SuccessOrExit(err);
@@ -465,7 +481,8 @@ static CHIP_ERROR ConvertCertificate(ASN1Reader & reader, TLVWriter & writer, Ta
                 // algorithm OBJECT IDENTIFIER,
                 ASN1_PARSE_OBJECT_ID(sigAlgoOID);
 
-                VerifyOrExit(sigAlgoOID == kOID_SigAlgo_ECDSAWithSHA256, err = ASN1_ERROR_UNSUPPORTED_ENCODING);
+                VerifyOrExit(sigAlgoOID == kOID_SigAlgo_ECDSAWithSHA256 || IsMLDSASigAlgo(sigAlgoOID),
+                             err = ASN1_ERROR_UNSUPPORTED_ENCODING);
 
                 err = writer.Put(ContextTag(kTag_SignatureAlgorithm), GetOIDEnum(sigAlgoOID));
                 SuccessOrExit(err);
@@ -540,7 +557,18 @@ static CHIP_ERROR ConvertCertificate(ASN1Reader & reader, TLVWriter & writer, Ta
         // signatureValue BIT STRING
         ASN1_PARSE_ELEMENT(kASN1TagClass_Universal, kASN1UniversalTag_BitString);
 
-        ReturnErrorOnFailure(ConvertECDSASignatureDERToRaw(reader, writer, ContextTag(kTag_ECDSASignature)));
+        if (IsMLDSASigAlgo(sigAlgoOID))
+        {
+            // ML-DSA signatures are raw byte strings (not DER-encoded r,s integers like ECDSA).
+            // The BIT STRING value starts with an Unused Bit Count byte (should be 0).
+            VerifyOrExit(reader.GetValueLen() > 0 && reader.GetValue()[0] == 0, err = ASN1_ERROR_INVALID_ENCODING);
+            ReturnErrorOnFailure(
+                writer.PutBytes(ContextTag(kTag_ECDSASignature), reader.GetValue() + 1, reader.GetValueLen() - 1));
+        }
+        else
+        {
+            ReturnErrorOnFailure(ConvertECDSASignatureDERToRaw(reader, writer, ContextTag(kTag_ECDSASignature)));
+        }
     }
     ASN1_EXIT_SEQUENCE;
 

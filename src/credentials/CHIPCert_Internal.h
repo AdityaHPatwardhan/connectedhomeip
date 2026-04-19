@@ -26,6 +26,9 @@ namespace Credentials {
 // The decode buffer is used to reconstruct TBS section of X.509 certificate, which doesn't include signature.
 inline constexpr size_t kMaxCHIPCertDecodeBufLength = kMaxDERCertLength - Crypto::kMax_ECDSA_Signature_Length_Der;
 
+// PQC variant: ML-DSA-65 signatures are up to 3309 bytes.
+inline constexpr size_t kMaxPQCCHIPCertDecodeBufLength = kMaxPQCDERCertLength - 3309;
+
 // The TBSCerticate of a Network (Client) Identity has a fixed (smaller) size.
 inline constexpr size_t kNetworkIdentityTBSLength = 244;
 
