@@ -15,14 +15,31 @@
 #    limitations under the License.
 #
 
-# See TC_DA_PQC_common.py for the required arguments and fixture generation.
+# === BEGIN CI TEST ARGUMENTS ===
+# test-runner-runs:
+#   run1:
+#     script-args: >
+#       --storage-path admin_storage-TC_DA_1_13.json
+#       --PICS src/app/tests/suites/certification/ci-pics-values-pqc
+#       --string-arg app_path:${ALL_CLUSTERS_APP}
+#       --string-arg pqc_dac_provider_ml_dsa_44:credentials/development/attestation/TestCredentials-FFF1-8001-ML-DSA-44.json
+#       --string-arg pqc_dac_provider_ml_dsa_65:credentials/development/attestation/TestCredentials-FFF1-8001-ML-DSA-65.json
+#       --paa-trust-store-path credentials/development/paa-root-certs
+#       --bool-arg dut_supports_pqc_profiles:true
+#       --trace-to json:${TRACE_TEST_JSON}.json
+#       --trace-to perfetto:${TRACE_TEST_PERFETTO}.perfetto
+#     factory-reset: true
+#     quiet: true
+# === END CI TEST ARGUMENTS ===
+
+# See TC_DA_PQC_common.py for the required arguments and fixture locations.
 #
 # dut_supports_pqc_profiles selects the matrix column: when true, rows 2 and 3
 # additionally require segmented chain retrieval in the TH app log (the "using
-# MlDsa44/65" half of the row outcome); when false (the SDK-CI default: standard CI
-# controller builds use a crypto backend without ML-DSA, so negotiation falls back),
-# commissioning success over the legacy fallback is the row result. Run the true column
-# with a controller built with chip_crypto="openssl" against OpenSSL 3.5+.
+# MlDsa44/65" half of the row outcome); when false, commissioning success over the
+# legacy fallback is the row result. The true column requires a controller built with
+# chip_crypto="openssl" against OpenSSL 3.5+, which is what the openssl_3_5_tests CI job
+# provides (the CI arguments above are written for that job).
 
 from TC_DA_PQC_common import PQCDACommissionerTestBase
 

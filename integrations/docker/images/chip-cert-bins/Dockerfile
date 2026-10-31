@@ -232,8 +232,10 @@ RUN case ${TARGETPLATFORM} in \
     && : # last line
 
 # Separate copies of the apps used by the openssl_3_5_tests CI job, statically
-# linked against the private OpenSSL 3.5 as in that job. The regular builds
-# above are unchanged. Remove once Ubuntu's system OpenSSL is 3.5.
+# linked against the private OpenSSL 3.5 as in that job, plus a chip-tool able
+# to act as the PQC-capable commissioner for the TC-DA-1.11/1.13 true column.
+# The regular builds above are unchanged. Remove once Ubuntu's system OpenSSL
+# is 3.5.
 RUN case ${TARGETPLATFORM} in \
     "linux/amd64") ARCH=linux-x64 ;; \
     "linux/arm64") ARCH=linux-arm64 ;; \
@@ -247,10 +249,12 @@ RUN case ${TARGETPLATFORM} in \
     --out-prefix ${OSSL_OUT} \
     --target ${ARCH}-all-devices-ipv6only \
     --target ${ARCH}-network-manager-ipv6only \
+    --target ${ARCH}-chip-tool-ipv6only-platform-mdns-nfc-commission \
     build \
     && for app in \
         ${OSSL_OUT}/${ARCH}-all-devices-ipv6only/all-devices-app \
-        ${OSSL_OUT}/${ARCH}-network-manager-ipv6only/matter-network-manager-app; do \
+        ${OSSL_OUT}/${ARCH}-network-manager-ipv6only/matter-network-manager-app \
+        ${OSSL_OUT}/${ARCH}-chip-tool-ipv6only-platform-mdns-nfc-commission/chip-tool; do \
         ! readelf -d ${app} | grep -E 'NEEDED.*lib(ssl|crypto)\.so' \
         && strip --strip-unneeded ${app} \
         && mv ${app} out/openssl3_5-$(basename ${app}) \
@@ -378,3 +382,9 @@ WORKDIR /root
 RUN mkdir -p credentials/test/revoked-attestation-certificates
 COPY --from=chip-build-cert-bins /root/connectedhomeip/credentials/test/revoked-attestation-certificates/dac-provider-test-vectors credentials/test/revoked-attestation-certificates/dac-provider-test-vectors
 COPY --from=chip-build-cert-bins /root/connectedhomeip/credentials/test/revoked-attestation-certificates/revocation-sets credentials/test/revoked-attestation-certificates/revocation-sets
+
+# PQC development DAC-provider fixtures and the trust store holding the ML-DSA
+# PAAs, used by TC_OPCREDS_3_9, TC_DA_1_10, TC_DA_1_11, TC_DA_1_12 and
+# TC_DA_1_13 (see the CI test arguments in those scripts).
+COPY --from=chip-build-cert-bins /root/connectedhomeip/credentials/development/attestation credentials/development/attestation
+COPY --from=chip-build-cert-bins /root/connectedhomeip/credentials/development/paa-root-certs credentials/development/paa-root-certs
